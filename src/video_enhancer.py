@@ -7,7 +7,7 @@ from threading import Thread
 import cv2
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QLineEdit,
                              QPushButton, QComboBox, QCheckBox, QVBoxLayout, QWidget,
-                             QProgressBar, QTextEdit, QHBoxLayout)
+                             QProgressBar, QTextEdit, QHBoxLayout, QMessageBox)
 from PyQt5.QtCore import pyqtSignal, QObject, Qt, QPointF
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QPolygonF
 
@@ -1285,6 +1285,11 @@ class VideoDownloader(FrostedGlassWindow):
         self.cancel_btn.setEnabled(False)
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
+        
+        if cancel_flag:
+            return
+        
+        QMessageBox.information(self, "完成", "视频处理完成！", QMessageBox.Ok)
 
     def on_error(self, error_msg):
         global current_running_process
@@ -1294,6 +1299,13 @@ class VideoDownloader(FrostedGlassWindow):
         self.cancel_btn.setEnabled(False)
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
+        
+        if cancel_flag:
+            return
+        
+        critical_errors = ['下载失败', '格式转换失败', '未找到', '不存在']
+        if any(keyword in error_msg for keyword in critical_errors):
+            QMessageBox.critical(self, "错误", f"{error_msg}", QMessageBox.Ok)
 
     def cancel_process(self):
         """终止当前运行的任务"""
@@ -1347,7 +1359,7 @@ class VideoDownloader(FrostedGlassWindow):
         need_enhance = self.enhance_check.isChecked()
         
         if not url:
-            self.status_text.append("请输入视频URL")
+            QMessageBox.warning(self, "提示", "请输入视频URL", QMessageBox.Ok)
             return
 
         self.download_btn.setEnabled(False)
