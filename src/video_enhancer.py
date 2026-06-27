@@ -1067,7 +1067,7 @@ class VideoDownloader(FrostedGlassWindow):
         
         self.cancel_btn = QPushButton("取消")
         self.cancel_btn.setMaximumWidth(80)
-        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.hide()  # 初始隐藏，任务进行时显示
         self.cancel_btn.setStyleSheet("""
             background-color: rgba(255, 59, 48, 220);
             color: white;
@@ -1282,7 +1282,7 @@ class VideoDownloader(FrostedGlassWindow):
         self.status_text.append(message)
         self.progress_bar.setValue(100)
         self.download_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.hide()
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
         
@@ -1296,7 +1296,7 @@ class VideoDownloader(FrostedGlassWindow):
         current_running_process = None
         self.status_text.append(f"错误: {error_msg}")
         self.download_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.hide()
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
         
@@ -1317,7 +1317,7 @@ class VideoDownloader(FrostedGlassWindow):
         self.status_text.append("操作已取消")
         self.progress_bar.setValue(0)
         self.download_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.hide()
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
         # 重置步骤显示
@@ -1363,7 +1363,7 @@ class VideoDownloader(FrostedGlassWindow):
             return
 
         self.download_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.show()
         self.progress_bar.setValue(0)
         self.status_text.clear()
         self.status_text.append("开始处理...")
