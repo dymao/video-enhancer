@@ -1387,6 +1387,31 @@ class VideoDownloader(FrostedGlassWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setWindowIcon(create_app_icon())  # 设置应用程序图标
+    
+    app.setStyleSheet("""
+        QMessageBox QPushButton {
+            border: 1px solid #007AFF;
+            padding: 6px 20px;
+            border-radius: 6px;
+            background-color: #007AFF;
+            color: white;
+            font-weight: bold;
+            margin: 0;
+            min-width: 80px;
+        }
+        QMessageBox QPushButton:hover {
+            background-color: #0056CC;
+            border-color: #0056CC;
+        }
+        QMessageBox QPushButton:pressed {
+            background-color: #003D99;
+            border-color: #003D99;
+        }
+        QMessageBox QPushButton:default {
+            background-color: #007AFF;
+            border-color: #007AFF;
+        }
+    """)
     window = VideoDownloader()
     window.show()
     sys.exit(app.exec_())
