@@ -69,6 +69,28 @@ def update_url_state(url, **kwargs):
     save_task_state(state)
     
 
+def get_existing_frame_numbers(frames_dir):
+    """读取已提取帧编号，用于判断是否可以断点续提取。"""
+    frame_numbers = set()
+    if not os.path.exists(frames_dir):
+        return frame_numbers
+    
+    for file_name in os.listdir(frames_dir):
+        match = re.match(r'^frame_(\d{8})\.png$', file_name)
+        if match:
+            frame_numbers.add(int(match.group(1)))
+    
+    return frame_numbers
+
+
+def get_contiguous_frame_count(frame_numbers):
+    """返回从 frame_00000001.png 开始连续存在的帧数量。"""
+    contiguous_count = 0
+    while contiguous_count + 1 in frame_numbers:
+        contiguous_count += 1
+    return contiguous_count
+
+
 def is_supported_video_url(url):
     """判断是否为当前工具支持的 B 站视频地址。"""
     parsed_url = urlparse(url)
@@ -469,14 +491,16 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     enhanced_exist = os.path.exists(enhanced_dir)
                     
                     # 检查已提取的帧数是否匹配
+                    existing_frame_numbers = get_existing_frame_numbers(frames_dir)
+                    existing_frames = len(existing_frame_numbers)
                     if frames_exist:
-                        existing_frames = len([f for f in os.listdir(frames_dir) if f.endswith('.png')])
-                        frames_match = existing_frames == total_video_frames
+                        frames_match = (
+                            total_video_frames > 0
+                            and existing_frames == total_video_frames
+                            and get_contiguous_frame_count(existing_frame_numbers) == total_video_frames
+                        )
                     else:
                         frames_match = False
-                    
-                    # 如果帧不匹配或不存在，清理并重新创建
-                    import shutil
                     
                     # B站 URL 参数可能变化；同一转换后文件也视为同一视频缓存。
                     frames_from_same_url = state_entry.get("frames_url") == url if state_entry else False
@@ -486,10 +510,28 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                         or state_entry.get("converted_path") == output_path
                     ) if state_entry else False
                     
+                    resume_extract_start_frame = None
                     if not frames_match:
-                        if os.path.exists(frames_dir):
-                            shutil.rmtree(frames_dir)
-                        os.makedirs(frames_dir, exist_ok=True)
+                        contiguous_frames = get_contiguous_frame_count(existing_frame_numbers)
+                        can_resume_extract = (
+                            frames_exist
+                            and frames_from_same_video
+                            and total_video_frames > 0
+                            and 0 < contiguous_frames < total_video_frames
+                            and contiguous_frames == existing_frames
+                        )
+                        
+                        if can_resume_extract:
+                            resume_extract_start_frame = contiguous_frames + 1
+                            os.makedirs(frames_dir, exist_ok=True)
+                            signals.progress.emit(
+                                0,
+                                f"检测到已提取 {contiguous_frames}/{total_video_frames} 帧，将继续提取剩余帧",
+                            )
+                        else:
+                            if os.path.exists(frames_dir):
+                                shutil.rmtree(frames_dir)
+                            os.makedirs(frames_dir, exist_ok=True)
                     elif frames_from_same_video:
                         signals.progress.emit(0, f"检测到已提取的帧 ({existing_frames}/{total_video_frames})，跳过提取步骤")
                     else:
@@ -515,22 +557,29 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     elif frames_match:
                         update_url_state(url, frames_url=url, frames_source_path=output_path)
                     
-                    # 原代码中额外处理
-                    if not frames_match:
-                        # 注：frames_match=False时，上面已经清理重建了frames_dir
-                        pass
+                    need_extract_frames = not (frames_match and frames_from_same_video)
                     
-                    # frames_match 后续引用，在原值基础上叠加 URL 检查
-                    if not (frames_match and frames_from_same_video):
-                        frames_match = False
-                    
-                    if frames_match and frames_from_same_video:
+                    if not need_extract_frames:
                         signals.progress.emit(0, f"检测到已提取的帧 ({total_video_frames} 帧)，跳过提取步骤")
                     else:
-                        signals.progress.emit(0, "提取视频帧...")
+                        if resume_extract_start_frame:
+                            signals.progress.emit(0, f"从第 {resume_extract_start_frame} 帧继续提取视频帧...")
+                        else:
+                            signals.progress.emit(0, "提取视频帧...")
                         
                         # 使用 Popen 实时读取提取进度
-                        extract_cmd = ['ffmpeg', '-y', '-i', output_path, '-q:v', '1', f'{frames_dir}/frame_%08d.png']
+                        if resume_extract_start_frame:
+                            extract_start_index = resume_extract_start_frame - 1
+                            extract_cmd = [
+                                'ffmpeg', '-y', '-i', output_path,
+                                '-vf', f'select=gte(n\\,{extract_start_index})',
+                                '-vsync', '0',
+                                '-q:v', '1',
+                                '-start_number', str(resume_extract_start_frame),
+                                f'{frames_dir}/frame_%08d.png'
+                            ]
+                        else:
+                            extract_cmd = ['ffmpeg', '-y', '-i', output_path, '-q:v', '1', f'{frames_dir}/frame_%08d.png']
                         extract_process = subprocess.Popen(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                                           text=True, bufsize=1, universal_newlines=True)
                         current_running_process = extract_process
@@ -543,14 +592,19 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                                     try:
                                         frame_part = line.split('frame=')[1].split()[0]
                                         current_frame = int(frame_part.strip())
-                                        percent = round((current_frame / total_video_frames) * 100, 2) if total_video_frames > 0 else 0
+                                        actual_frame = (
+                                            current_frame + resume_extract_start_frame - 1
+                                            if resume_extract_start_frame
+                                            else current_frame
+                                        )
+                                        percent = round((actual_frame / total_video_frames) * 100, 2) if total_video_frames > 0 else 0
                                         if percent > last_extract_progress:
-                                            signals.progress.emit(int(percent), f"提取视频帧: {percent:.2f}% ({current_frame}/{total_video_frames})")
+                                            signals.progress.emit(int(percent), f"提取视频帧: {percent:.2f}% ({actual_frame}/{total_video_frames})")
                                             last_extract_progress = percent
                                     except:
                                         pass
                     
-                    if not frames_match:
+                    if need_extract_frames:
                         extract_process.wait()
                     
                     # 保存帧提取状态，下次运行可直接复用
