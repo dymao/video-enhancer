@@ -590,7 +590,7 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                             shutil.copy2(os.path.join(frames_dir, f), os.path.join(batch_dir, f))
                         
                         enhance_cmd = [realesrgan_path, '-i', batch_dir, '-o', f'{enhanced_dir}/',
-                                      '-n', model_name, '-m', model_dir, '-s', '4', '-j', '4:8:4', '-g', '0']
+                                      '-n', model_name, '-m', model_dir, '-s', '4', '-j', '1:2:1', '-g', '0']
                         process = subprocess.Popen(enhance_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                  text=True, bufsize=1, universal_newlines=True)
                         current_running_process = process
@@ -613,7 +613,11 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                                     signals.progress.emit(int(percent), f"AI 超分辨率: {percent:.2f}% ({total_processed}/{total_frames} 帧)")
                             except:
                                 pass
-                            time.sleep(0.5)
+                            # 每 3 秒轮询一次进度，避免频繁 listdir 导致卡顿
+                            for _ in range(6):
+                                if cancel_flag:
+                                    break
+                                time.sleep(0.5)
                         
                         shutil.rmtree(batch_dir, ignore_errors=True)
                         
