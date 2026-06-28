@@ -4,6 +4,9 @@ import subprocess
 import shutil
 import re
 from threading import Thread
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 import cv2
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QLineEdit,
                              QPushButton, QComboBox, QCheckBox, QVBoxLayout, QWidget,
@@ -17,6 +20,48 @@ cancel_flag = False
 
 # 项目根目录路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def is_supported_video_url(url):
+    """判断是否为当前工具支持的 B 站视频地址。"""
+    parsed_url = urlparse(url)
+    hostname = (parsed_url.hostname or "").lower()
+    path = parsed_url.path.rstrip("/")
+    
+    if hostname == "b23.tv" or hostname.endswith(".b23.tv"):
+        return True
+    
+    if hostname == "bilibili.com" or hostname.endswith(".bilibili.com"):
+        return path.startswith("/video/") or path.startswith("/bangumi/play/")
+    
+    return False
+
+
+def check_url_accessible(url, timeout=8):
+    """检测输入地址是否可访问，避免无效地址直接进入下载流程。"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0 Safari/537.36"
+        ),
+        "Range": "bytes=0-0",
+    }
+    
+    try:
+        request = Request(url, headers=headers, method="GET")
+        with urlopen(request, timeout=timeout) as response:
+            status_code = response.getcode()
+            return 200 <= status_code < 400, "", response.geturl()
+    except HTTPError as e:
+        # 401/403 说明地址可达但需要登录或权限，不应阻止后续 cookies 下载。
+        if e.code in (401, 403):
+            return True, "", e.url
+        return False, f"HTTP {e.code}", e.url
+    except URLError as e:
+        return False, str(e.reason), ""
+    except Exception as e:
+        return False, str(e), ""
 
 
 def create_app_icon():
@@ -897,7 +942,7 @@ class VideoDownloader(FrostedGlassWindow):
                 line.setStyleSheet("background-color: rgba(200, 200, 200, 200);")
 
     def init_ui(self):
-        self.setWindowTitle("视频增强处理工具 - Video Enhancer")
+        self.setWindowTitle("B站视频增强下载器")
         self.setWindowIcon(create_app_icon())  # 设置窗口图标
         self.setGeometry(300, 300, 1200, 900)
 
@@ -1360,6 +1405,27 @@ class VideoDownloader(FrostedGlassWindow):
         
         if not url:
             QMessageBox.warning(self, "提示", "请输入视频URL", QMessageBox.Ok)
+            return
+        
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+            QMessageBox.warning(self, "提示", "地址非法，请输入 http 或 https 的网址", QMessageBox.Ok)
+            return
+        
+        if not is_supported_video_url(url):
+            QMessageBox.warning(self, "提示", "地址非法，请输入 B 站视频地址", QMessageBox.Ok)
+            return
+        
+        is_accessible, error_reason, final_url = check_url_accessible(url)
+        if not is_accessible:
+            message = "地址无效或无法访问，请检查后重新输入"
+            if error_reason:
+                message += f"\n原因：{error_reason}"
+            QMessageBox.warning(self, "提示", message, QMessageBox.Ok)
+            return
+        
+        if final_url and not is_supported_video_url(final_url):
+            QMessageBox.warning(self, "提示", "地址非法，请输入 B 站视频地址", QMessageBox.Ok)
             return
 
         self.download_btn.setEnabled(False)
