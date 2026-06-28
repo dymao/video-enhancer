@@ -1215,8 +1215,8 @@ class VideoDownloader(FrostedGlassWindow):
         self.download_btn.clicked.connect(self.process_video)
         btn_layout.addWidget(self.download_btn)
         
-        self.cancel_btn = QPushButton("取消")
-        self.cancel_btn.setMaximumWidth(80)
+        self.cancel_btn = QPushButton("取消当前")
+        self.cancel_btn.setMaximumWidth(90)
         self.cancel_btn.hide()  # 初始隐藏，任务进行时显示
         self.cancel_btn.setStyleSheet("""
             background-color: rgba(255, 59, 48, 220);
@@ -1228,6 +1228,13 @@ class VideoDownloader(FrostedGlassWindow):
         """)
         self.cancel_btn.clicked.connect(self.cancel_process)
         btn_layout.addWidget(self.cancel_btn)
+        
+        self.cancel_all_btn = QPushButton("取消全部")
+        self.cancel_all_btn.setMaximumWidth(90)
+        self.cancel_all_btn.hide()
+        self.cancel_all_btn.setStyleSheet(self.cancel_btn.styleSheet())
+        self.cancel_all_btn.clicked.connect(self.cancel_all_process)
+        btn_layout.addWidget(self.cancel_all_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
@@ -1459,6 +1466,7 @@ class VideoDownloader(FrostedGlassWindow):
         
         self.set_task_controls_enabled(True)
         self.cancel_btn.hide()
+        self.cancel_all_btn.hide()
         QMessageBox.information(self, "完成", "视频处理完成！", QMessageBox.Ok)
 
     def on_error(self, error_msg):
@@ -1476,6 +1484,7 @@ class VideoDownloader(FrostedGlassWindow):
             self.batch_running = False
             self.set_task_controls_enabled(True)
             self.cancel_btn.hide()
+            self.cancel_all_btn.hide()
             self.update_task_status_label("cancelled")
             return
         
@@ -1488,12 +1497,13 @@ class VideoDownloader(FrostedGlassWindow):
         
         self.set_task_controls_enabled(True)
         self.cancel_btn.hide()
+        self.cancel_all_btn.hide()
         critical_errors = ['下载失败', '格式转换失败', '未找到', '不存在']
         if any(keyword in error_msg for keyword in critical_errors):
             QMessageBox.critical(self, "错误", f"{error_msg}", QMessageBox.Ok)
 
     def cancel_process(self):
-        """终止当前运行的任务"""
+        """取消当前任务。批量模式下跳过当前任务并继续下一个任务。"""
         global current_running_process, cancel_flag, cancelled_process_ids
         was_batch_running = self.batch_running
         cancelled_task_number = self.current_task_index + 1
@@ -1511,7 +1521,9 @@ class VideoDownloader(FrostedGlassWindow):
             self.failed_count += 1
             if should_ignore_cancel_error:
                 self.ignore_cancel_error_count += 1
-            self.status_text.append(f"任务 {cancelled_task_number}/{len(self.task_urls)} 已取消，继续下一个任务")
+            has_next_task = cancelled_task_number < len(self.task_urls)
+            next_action = "继续下一个任务" if has_next_task else "已没有后续任务"
+            self.status_text.append(f"任务 {cancelled_task_number}/{len(self.task_urls)} 已取消，{next_action}")
             self.current_task_index += 1
             cancel_flag = False
             self.start_time = None
@@ -1524,6 +1536,7 @@ class VideoDownloader(FrostedGlassWindow):
         self.batch_running = False
         self.set_task_controls_enabled(True)
         self.cancel_btn.hide()
+        self.cancel_all_btn.hide()
         self.update_task_status_label("cancelled")
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
@@ -1548,6 +1561,37 @@ class VideoDownloader(FrostedGlassWindow):
         # 重置连接线
         for line in self.step_lines:
             line.setStyleSheet("background-color: rgba(200, 200, 200, 200);")
+
+    def cancel_all_process(self):
+        """取消全部任务，终止当前任务并停止后续队列。"""
+        global current_running_process, cancel_flag, cancelled_process_ids
+        was_batch_running = self.batch_running
+        should_ignore_cancel_error = False
+        cancel_flag = True
+        
+        if current_running_process:
+            command_text = " ".join(current_running_process.args) if isinstance(current_running_process.args, list) else str(current_running_process.args)
+            should_ignore_cancel_error = "you_get" not in command_text
+            if current_running_process.pid:
+                cancelled_process_ids.add(current_running_process.pid)
+            current_running_process.terminate()
+            current_running_process = None
+        
+        if was_batch_running and self.current_task_index < len(self.task_urls):
+            self.failed_count += 1
+            if should_ignore_cancel_error:
+                self.ignore_cancel_error_count += 1
+        
+        self.batch_running = False
+        self.status_text.append("全部任务已取消")
+        self.progress_bar.setValue(0)
+        self.set_task_controls_enabled(True)
+        self.cancel_btn.hide()
+        self.cancel_all_btn.hide()
+        self.update_task_status_label("cancelled")
+        self.start_time = None
+        self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
+        self.reset_step_display()
     
     def browse_output_dir(self):
         """浏览选择输出目录"""
@@ -1702,6 +1746,7 @@ class VideoDownloader(FrostedGlassWindow):
             self.batch_running = False
             self.set_task_controls_enabled(True)
             self.cancel_btn.hide()
+            self.cancel_all_btn.hide()
             self.task_list.clearSelection()
             self.update_task_status_label("completed")
             summary = f"批量处理完成！成功 {self.success_count} 个，失败 {self.failed_count} 个。"
@@ -1763,6 +1808,7 @@ class VideoDownloader(FrostedGlassWindow):
         
         self.set_task_controls_enabled(False)
         self.cancel_btn.show()
+        self.cancel_all_btn.show()
         self.status_text.clear()
         self.status_text.append(f"开始批量处理，共 {len(self.task_urls)} 个任务")
         self.update_task_status_label("running")
