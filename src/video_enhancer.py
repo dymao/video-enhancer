@@ -10,13 +10,14 @@ from urllib.request import Request, urlopen
 import cv2
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QLabel, QLineEdit,
                              QPushButton, QComboBox, QCheckBox, QVBoxLayout, QWidget,
-                             QProgressBar, QTextEdit, QHBoxLayout, QMessageBox)
+                             QProgressBar, QTextEdit, QHBoxLayout, QMessageBox, QListWidget)
 from PyQt5.QtCore import pyqtSignal, QObject, Qt, QPointF
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QPolygonF
 
 # 全局变量，用于跟踪当前运行的任务和取消状态
 current_running_process = None
 cancel_flag = False
+cancelled_process_ids = set()
 
 # 项目根目录路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -178,6 +179,11 @@ def download_video_with_progress(url, output_dir, cookies_file, signals):
         
         process.wait()
         
+        if cancel_flag or process.pid in cancelled_process_ids:
+            cancelled_process_ids.discard(process.pid)
+            signals.progress.emit(0, "当前任务已取消")
+            return False
+        
         if process.returncode == 0:
             signals.progress.emit(0, "下载完成，开始处理视频...")
             return True
@@ -191,6 +197,25 @@ def download_video_with_progress(url, output_dir, cookies_file, signals):
 
 def process_video_task(url, output_dir, cookies_file, output_format, need_enhance, signals):
     global cancel_flag
+    
+    def collect_source_videos():
+        video_extensions = ('.mp4', '.flv', '.mkv', '.webm')
+        source_videos = []
+        if not os.path.isdir(output_dir):
+            return source_videos
+        
+        for filename in os.listdir(output_dir):
+            name_lower = filename.lower()
+            base_name = os.path.splitext(filename)[0].lower()
+            if not name_lower.endswith(video_extensions):
+                continue
+            if base_name.startswith("temp_") or "_processed" in base_name or "_enhanced" in base_name:
+                continue
+            source_videos.append(filename)
+        return source_videos
+    
+    before_download_files = set(collect_source_videos())
+    
     # 步骤0：下载视频
     signals.step_changed.emit(0, 'running')
     
@@ -205,8 +230,16 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
         signals.progress.emit(0, "任务已取消")
         return
     
-    # 查找下载的视频文件
-    downloaded_files = [f for f in os.listdir(output_dir) if f.endswith(('.mp4', '.flv', '.mkv', '.webm')) and f != f"output.{output_format}"]
+    # 查找本次下载的视频文件，避免批量任务误处理目录中的旧文件。
+    after_download_files = collect_source_videos()
+    downloaded_files = [f for f in after_download_files if f not in before_download_files]
+    if not downloaded_files:
+        downloaded_files = after_download_files
+    
+    downloaded_files = sorted(
+        downloaded_files,
+        key=lambda f: os.path.getmtime(os.path.join(output_dir, f))
+    )
     signals.progress.emit(0, f"找到的视频文件: {downloaded_files}")
     
     if not downloaded_files:
@@ -865,6 +898,14 @@ class VideoDownloader(FrostedGlassWindow):
     def __init__(self):
         super().__init__()
         self.start_time = None  # 记录任务开始时间
+        self.task_urls = []
+        self.current_task_index = 0
+        self.success_count = 0
+        self.failed_count = 0
+        self.batch_running = False
+        self.batch_settings = {}
+        self.process_thread = None
+        self.ignore_cancel_error_count = 0
         self.init_ui()
         self.signals = DownloadSignals()
         self.signals.progress.connect(self.update_progress)
@@ -1025,10 +1066,74 @@ class VideoDownloader(FrostedGlassWindow):
         """
 
         layout.addWidget(QLabel("B站视频链接URL:"))
+        url_layout = QHBoxLayout()
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("请输入B站视频链接")
         self.url_input.setStyleSheet(input_style)
-        layout.addWidget(self.url_input)
+        url_layout.addWidget(self.url_input)
+        
+        self.add_task_btn = QPushButton("添加任务")
+        self.add_task_btn.setMaximumWidth(100)
+        self.add_task_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(52, 199, 89, 220);
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 8px 15px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(52, 199, 89, 255);
+            }
+            QPushButton:pressed {
+                background-color: rgba(40, 167, 69, 220);
+            }
+            QPushButton:disabled {
+                background-color: rgba(180, 180, 180, 180);
+                color: rgba(120, 120, 120, 180);
+            }
+        """)
+        self.add_task_btn.clicked.connect(self.add_task_from_input)
+        url_layout.addWidget(self.add_task_btn)
+        layout.addLayout(url_layout)
+        
+        layout.addWidget(QLabel("任务列表（按添加顺序逐个下载和转换）:"))
+        self.task_list = QListWidget()
+        self.task_list.setStyleSheet("""
+            QListWidget {
+                background-color: rgba(255, 255, 255, 180);
+                border: 1px solid rgba(200, 200, 200, 150);
+                border-radius: 5px;
+                color: #333;
+                padding: 5px;
+            }
+            QListWidget::item {
+                padding: 6px;
+                border-radius: 4px;
+            }
+            QListWidget::item:selected {
+                background-color: rgba(0, 122, 255, 180);
+                color: white;
+            }
+        """)
+        self.task_list.setMaximumHeight(110)
+        layout.addWidget(self.task_list)
+        
+        task_btn_layout = QHBoxLayout()
+        task_btn_layout.addStretch()
+        self.remove_task_btn = QPushButton("删除选中")
+        self.remove_task_btn.setMaximumWidth(100)
+        self.remove_task_btn.setStyleSheet(self.add_task_btn.styleSheet())
+        self.remove_task_btn.clicked.connect(self.remove_selected_task)
+        task_btn_layout.addWidget(self.remove_task_btn)
+        
+        self.clear_task_btn = QPushButton("清空列表")
+        self.clear_task_btn.setMaximumWidth(100)
+        self.clear_task_btn.setStyleSheet(self.add_task_btn.styleSheet())
+        self.clear_task_btn.clicked.connect(self.clear_task_list)
+        task_btn_layout.addWidget(self.clear_task_btn)
+        layout.addLayout(task_btn_layout)
 
         layout.addWidget(QLabel("Cookies文件路径（下载720p+高清视频需要）:"))
         self.cookies_input = QLineEdit()
@@ -1126,7 +1231,18 @@ class VideoDownloader(FrostedGlassWindow):
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
-        self.progress_label = QLabel("流程:")
+        self.task_status_label = QLabel("任务状态：未开始")
+        self.task_status_label.setStyleSheet("""
+            QLabel {
+                color: #007AFF;
+                font-size: 15px;
+                font-weight: bold;
+                padding: 4px 0;
+            }
+        """)
+        layout.addWidget(self.task_status_label)
+
+        self.progress_label = QLabel("当前任务流程:")
         self.progress_label.setStyleSheet("color: #333; font-weight: bold;")
         layout.addWidget(self.progress_label)
         
@@ -1325,44 +1441,90 @@ class VideoDownloader(FrostedGlassWindow):
         global current_running_process
         current_running_process = None
         self.status_text.append(message)
-        self.progress_bar.setValue(100)
-        self.download_btn.setEnabled(True)
-        self.cancel_btn.hide()
+        self.progress_bar.setValue(10000)
+        self.progress_bar.setFormat("100.00%")
+        self.progress_percent_label.setText("100.00%")
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
         
         if cancel_flag:
             return
         
+        if self.batch_running:
+            self.success_count += 1
+            self.status_text.append(f"任务 {self.current_task_index + 1}/{len(self.task_urls)} 处理完成")
+            self.current_task_index += 1
+            self.run_next_task()
+            return
+        
+        self.set_task_controls_enabled(True)
+        self.cancel_btn.hide()
         QMessageBox.information(self, "完成", "视频处理完成！", QMessageBox.Ok)
 
     def on_error(self, error_msg):
         global current_running_process
         current_running_process = None
+        if self.ignore_cancel_error_count > 0:
+            self.ignore_cancel_error_count -= 1
+            return
+        
         self.status_text.append(f"错误: {error_msg}")
-        self.download_btn.setEnabled(True)
-        self.cancel_btn.hide()
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
         
         if cancel_flag:
+            self.batch_running = False
+            self.set_task_controls_enabled(True)
+            self.cancel_btn.hide()
+            self.update_task_status_label("cancelled")
             return
         
+        if self.batch_running:
+            self.failed_count += 1
+            self.status_text.append(f"任务 {self.current_task_index + 1}/{len(self.task_urls)} 处理失败，继续下一个任务")
+            self.current_task_index += 1
+            self.run_next_task()
+            return
+        
+        self.set_task_controls_enabled(True)
+        self.cancel_btn.hide()
         critical_errors = ['下载失败', '格式转换失败', '未找到', '不存在']
         if any(keyword in error_msg for keyword in critical_errors):
             QMessageBox.critical(self, "错误", f"{error_msg}", QMessageBox.Ok)
 
     def cancel_process(self):
         """终止当前运行的任务"""
-        global current_running_process, cancel_flag
+        global current_running_process, cancel_flag, cancelled_process_ids
+        was_batch_running = self.batch_running
+        cancelled_task_number = self.current_task_index + 1
+        should_ignore_cancel_error = False
         cancel_flag = True  # 设置取消标志
         if current_running_process:
+            command_text = " ".join(current_running_process.args) if isinstance(current_running_process.args, list) else str(current_running_process.args)
+            should_ignore_cancel_error = "you_get" not in command_text
+            if current_running_process.pid:
+                cancelled_process_ids.add(current_running_process.pid)
             current_running_process.terminate()
             current_running_process = None
+        
+        if was_batch_running:
+            self.failed_count += 1
+            if should_ignore_cancel_error:
+                self.ignore_cancel_error_count += 1
+            self.status_text.append(f"任务 {cancelled_task_number}/{len(self.task_urls)} 已取消，继续下一个任务")
+            self.current_task_index += 1
+            cancel_flag = False
+            self.start_time = None
+            self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
+            self.run_next_task()
+            return
+        
         self.status_text.append("操作已取消")
         self.progress_bar.setValue(0)
-        self.download_btn.setEnabled(True)
+        self.batch_running = False
+        self.set_task_controls_enabled(True)
         self.cancel_btn.hide()
+        self.update_task_status_label("cancelled")
         self.start_time = None  # 重置开始时间
         self.time_label.setText("已耗时: --:-- | 预估剩余: --:--")
         # 重置步骤显示
@@ -1394,61 +1556,217 @@ class VideoDownloader(FrostedGlassWindow):
         if directory:
             self.output_dir_input.setText(directory)
 
-    def process_video(self):
-        global current_running_process, cancel_flag
-        current_running_process = None
-        cancel_flag = False  # 重置取消标志
-        url = self.url_input.text().strip()
-        cookies_file = self.cookies_input.text().strip()
-        output_format = self.format_box.currentText()
-        need_enhance = self.enhance_check.isChecked()
-        
+    def validate_video_url(self, url):
+        """校验 URL 格式、支持范围和可访问性。"""
         if not url:
-            QMessageBox.warning(self, "提示", "请输入视频URL", QMessageBox.Ok)
-            return
+            return False, "请输入视频URL"
         
         parsed_url = urlparse(url)
         if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
-            QMessageBox.warning(self, "提示", "地址非法，请输入 http 或 https 的网址", QMessageBox.Ok)
-            return
+            return False, "地址非法，请输入 http 或 https 的网址"
         
         if not is_supported_video_url(url):
-            QMessageBox.warning(self, "提示", "地址非法，请输入 B 站视频地址", QMessageBox.Ok)
-            return
+            return False, "地址非法，请输入 B 站视频地址"
         
         is_accessible, error_reason, final_url = check_url_accessible(url)
         if not is_accessible:
             message = "地址无效或无法访问，请检查后重新输入"
             if error_reason:
                 message += f"\n原因：{error_reason}"
-            QMessageBox.warning(self, "提示", message, QMessageBox.Ok)
-            return
+            return False, message
         
         if final_url and not is_supported_video_url(final_url):
-            QMessageBox.warning(self, "提示", "地址非法，请输入 B 站视频地址", QMessageBox.Ok)
-            return
-
-        self.download_btn.setEnabled(False)
-        self.cancel_btn.show()
-        self.progress_bar.setValue(0)
-        self.status_text.clear()
-        self.status_text.append("开始处理...")
+            return False, "地址非法，请输入 B 站视频地址"
         
-        # 重置步骤显示
+        return True, ""
+
+    def add_task_from_input(self):
+        """将输入框中的 URL 添加到任务列表。"""
+        url = self.url_input.text().strip()
+        is_valid, message = self.validate_video_url(url)
+        if not is_valid:
+            QMessageBox.warning(self, "提示", message, QMessageBox.Ok)
+            return False
+        
+        existing_urls = self.get_task_urls()
+        if url in existing_urls:
+            QMessageBox.warning(self, "提示", "该 URL 已在任务列表中", QMessageBox.Ok)
+            return False
+        
+        self.task_list.addItem(url)
+        self.url_input.clear()
+        self.update_task_status_label()
+        return True
+
+    def remove_selected_task(self):
+        """删除当前选中的任务。"""
+        if self.task_list.count() == 0:
+            QMessageBox.information(self, "提示", "任务列表为空，请先添加任务", QMessageBox.Ok)
+            return
+        
+        selected_row = self.task_list.currentRow()
+        if selected_row >= 0:
+            self.task_list.takeItem(selected_row)
+            self.update_task_status_label()
+        else:
+            QMessageBox.information(self, "提示", "请先选择要删除的任务", QMessageBox.Ok)
+
+    def clear_task_list(self):
+        """清空任务列表。"""
+        if self.task_list.count() == 0:
+            QMessageBox.information(self, "提示", "任务列表为空，无需清空", QMessageBox.Ok)
+            return
+        
+        self.task_list.clear()
+        self.update_task_status_label()
+
+    def get_task_urls(self):
+        """获取任务列表中的 URL。"""
+        return [self.task_list.item(i).text() for i in range(self.task_list.count())]
+
+    def set_task_controls_enabled(self, enabled):
+        """根据任务状态启用或禁用相关控件。"""
+        self.download_btn.setEnabled(enabled)
+        self.add_task_btn.setEnabled(enabled)
+        self.remove_task_btn.setEnabled(enabled)
+        self.clear_task_btn.setEnabled(enabled)
+        self.browse_btn.setEnabled(enabled)
+        self.url_input.setEnabled(enabled)
+        self.cookies_input.setEnabled(enabled)
+        self.output_dir_input.setEnabled(enabled)
+        self.format_box.setEnabled(enabled)
+        self.enhance_check.setEnabled(enabled)
+
+    def update_task_status_label(self, status="idle"):
+        """更新批量任务状态显示。"""
+        total = len(self.task_urls) if self.task_urls else self.task_list.count()
+        current = self.current_task_index + 1 if total else 0
+        
+        if status == "running" and total:
+            self.task_status_label.setText(
+                f"任务状态：共有 <span style='color:#2F6F9F; font-weight:800;'>{total}</span> 个任务，"
+                f"当前第 <span style='color:#2F6F9F; font-weight:800;'>{current}</span> 个任务进行中"
+            )
+        elif status == "completed" and total:
+            self.task_status_label.setText(
+                f"任务状态：共有 <span style='color:#2F6F9F; font-weight:800;'>{total}</span> 个任务，"
+                f"已全部处理完成，成功 <span style='color:#28a745; font-weight:800;'>{self.success_count}</span> 个，"
+                f"失败 <span style='color:#FF3B30; font-weight:800;'>{self.failed_count}</span> 个"
+            )
+        elif status == "cancelled" and total:
+            current = min(current, total)
+            self.task_status_label.setText(
+                f"任务状态：共有 <span style='color:#2F6F9F; font-weight:800;'>{total}</span> 个任务，"
+                f"已在第 <span style='color:#2F6F9F; font-weight:800;'>{current}</span> 个任务取消"
+            )
+        elif total:
+            self.task_status_label.setText(
+                f"任务状态：共有 <span style='color:#2F6F9F; font-weight:800;'>{total}</span> 个任务，等待开始"
+            )
+        else:
+            self.task_status_label.setText("任务状态：未开始")
+
+    def reset_step_display(self):
+        """重置步骤显示和进度信息。"""
         steps = ["下载视频", "格式转换", "清晰度增强", "音视频同步"]
-        for i, label in enumerate(self.step_labels):
-            label.setText(f"{i+1}. {steps[i]}")
-            label.setStyleSheet("color: #999; font-size: 12px; padding: 5px 10px;")
+        for i in range(len(steps)):
+            circle = self.step_circles[i]
+            label = self.step_labels[i]
+            circle.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(255, 255, 255, 150);
+                    color: #999;
+                    border: 2px solid rgba(150, 150, 150, 200);
+                    border-radius: 15px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+            """)
+            circle.setText(str(i + 1))
+            label.setText(steps[i])
+            label.setStyleSheet("color: #999; font-size: 12px;")
+        
+        for line in self.step_lines:
+            line.setStyleSheet("background-color: rgba(200, 200, 200, 200);")
+        
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0.00%")
+        self.progress_percent_label.setText("0.00%")
+
+    def run_next_task(self):
+        """按任务列表顺序执行下一个任务。"""
+        if cancel_flag:
+            return
+        
+        if self.current_task_index >= len(self.task_urls):
+            self.batch_running = False
+            self.set_task_controls_enabled(True)
+            self.cancel_btn.hide()
+            self.task_list.clearSelection()
+            self.update_task_status_label("completed")
+            summary = f"批量处理完成！成功 {self.success_count} 个，失败 {self.failed_count} 个。"
+            self.status_text.append(summary)
+            QMessageBox.information(self, "完成", summary, QMessageBox.Ok)
+            return
+        
+        url = self.task_urls[self.current_task_index]
+        total = len(self.task_urls)
+        self.task_list.setCurrentRow(self.current_task_index)
+        self.reset_step_display()
+        self.update_task_status_label("running")
+        self.start_time = None
+        self.status_text.append(f"开始处理任务 {self.current_task_index + 1}/{total}: {url}")
+        
+        self.process_thread = Thread(
+            target=process_video_task,
+            args=(
+                url,
+                self.batch_settings["output_dir"],
+                self.batch_settings["cookies_file"],
+                self.batch_settings["output_format"],
+                self.batch_settings["need_enhance"],
+                self.signals
+            )
+        )
+        self.process_thread.daemon = True
+        self.process_thread.start()
+
+    def process_video(self):
+        global current_running_process, cancel_flag
+        current_running_process = None
+        cancel_flag = False  # 重置取消标志
+
+        if self.url_input.text().strip() and not self.add_task_from_input():
+            return
+        
+        task_urls = self.get_task_urls()
+        if not task_urls:
+            QMessageBox.warning(self, "提示", "请先添加至少一个 B 站视频任务", QMessageBox.Ok)
+            return
 
         output_dir = self.output_dir_input.text().strip()
         if not output_dir:
             output_dir = os.getcwd()
+        os.makedirs(output_dir, exist_ok=True)
         
-        process_thread = Thread(
-            target=process_video_task,
-            args=(url, output_dir, cookies_file, output_format, need_enhance, self.signals)
-        )
-        process_thread.start()
+        self.task_urls = task_urls
+        self.current_task_index = 0
+        self.success_count = 0
+        self.failed_count = 0
+        self.batch_running = True
+        self.batch_settings = {
+            "output_dir": output_dir,
+            "cookies_file": self.cookies_input.text().strip(),
+            "output_format": self.format_box.currentText(),
+            "need_enhance": self.enhance_check.isChecked()
+        }
+        
+        self.set_task_controls_enabled(False)
+        self.cancel_btn.show()
+        self.status_text.clear()
+        self.status_text.append(f"开始批量处理，共 {len(self.task_urls)} 个任务")
+        self.update_task_status_label("running")
+        self.run_next_task()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
