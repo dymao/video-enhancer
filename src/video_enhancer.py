@@ -475,24 +475,22 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     else:
                         frames_match = False
                     
-                    # 检查已增强的帧数是否匹配
-                    if enhanced_exist:
-                        existing_enhanced = len([f for f in os.listdir(enhanced_dir) if f.endswith('.png')])
-                        enhanced_match = existing_enhanced == total_video_frames
-                    else:
-                        enhanced_match = False
-                    
                     # 如果帧不匹配或不存在，清理并重新创建
                     import shutil
                     
-                    # 缓存帧所属的 URL 与当前 URL 一致时才复用
+                    # B站 URL 参数可能变化；同一转换后文件也视为同一视频缓存。
                     frames_from_same_url = state_entry.get("frames_url") == url if state_entry else False
+                    frames_from_same_video = (
+                        frames_from_same_url
+                        or state_entry.get("frames_source_path") == output_path
+                        or state_entry.get("converted_path") == output_path
+                    ) if state_entry else False
                     
                     if not frames_match:
                         if os.path.exists(frames_dir):
                             shutil.rmtree(frames_dir)
                         os.makedirs(frames_dir, exist_ok=True)
-                    elif frames_from_same_url:
+                    elif frames_from_same_video:
                         signals.progress.emit(0, f"检测到已提取的帧 ({existing_frames}/{total_video_frames})，跳过提取步骤")
                     else:
                         # 帧文件来自不同的视频 URL，清理后重新提取
@@ -501,24 +499,21 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                         os.makedirs(frames_dir, exist_ok=True)
                         frames_match = False
                     
-                    if not enhanced_match:
-                        if os.path.exists(enhanced_dir):
-                            shutil.rmtree(enhanced_dir)
+                    if not enhanced_exist:
                         os.makedirs(enhanced_dir, exist_ok=True)
-                    elif frames_from_same_url:
-                        pass  # 同 URL 复用已有增强帧
+                    elif frames_from_same_video:
+                        pass  # 同一视频复用已有增强帧，未完成的帧会在后续断点续传中继续处理
                     else:
                         # 增强帧来自不同的视频 URL，清理后重新处理
                         if os.path.exists(enhanced_dir):
                             shutil.rmtree(enhanced_dir)
                         os.makedirs(enhanced_dir, exist_ok=True)
-                        enhanced_match = False
                     
                     # 更新状态：记录当前视频的帧已提取
-                    if frames_match and frames_from_same_url:
+                    if frames_match and frames_from_same_video:
                         pass  # 已经记录过
                     elif frames_match:
-                        update_url_state(url, frames_url=url)
+                        update_url_state(url, frames_url=url, frames_source_path=output_path)
                     
                     # 原代码中额外处理
                     if not frames_match:
@@ -526,10 +521,10 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                         pass
                     
                     # frames_match 后续引用，在原值基础上叠加 URL 检查
-                    if not (frames_match and frames_from_same_url):
+                    if not (frames_match and frames_from_same_video):
                         frames_match = False
                     
-                    if frames_match and frames_from_same_url:
+                    if frames_match and frames_from_same_video:
                         signals.progress.emit(0, f"检测到已提取的帧 ({total_video_frames} 帧)，跳过提取步骤")
                     else:
                         signals.progress.emit(0, "提取视频帧...")
@@ -559,28 +554,31 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                         extract_process.wait()
                     
                     # 保存帧提取状态，下次运行可直接复用
-                    update_url_state(url, frames_url=url)
+                    update_url_state(url, frames_url=url, frames_source_path=output_path)
                     
                     # 检查是否已取消
                     if cancel_flag:
                         signals.progress.emit(0, "任务已取消")
                         return
                     
-                    # 检查是否已有缓存的增强帧
-                    total_frames = len([f for f in os.listdir(frames_dir) if f.endswith('.png')])
+                    # 仅遍历一次源帧目录，避免高帧数视频重复扫描导致卡顿。
+                    all_source_frames = sorted(f for f in os.listdir(frames_dir) if f.endswith('.png'))
+                    total_frames = len(all_source_frames)
                     
                     # ---- 帧级断点续传：检查已增强的帧，只处理未处理的帧 ----
                     already_enhanced = set()
                     if os.path.exists(enhanced_dir):
                         already_enhanced = set(f for f in os.listdir(enhanced_dir) if f.endswith('.png'))
                     
-                    all_source_frames = sorted(f for f in os.listdir(frames_dir) if f.endswith('.png'))
                     pending_frames = [f for f in all_source_frames if f not in already_enhanced]
                     
                     if not pending_frames:
                         signals.progress.emit(0, f"检测到已增强的帧 ({total_frames} 帧)，跳过 AI 超分辨率步骤")
                     else:
-                        signals.progress.emit(0, f"AI 超分辨率处理中（剩余 {len(pending_frames)}/{total_frames} 帧待处理）...")
+                        signals.progress.emit(
+                            0,
+                            f"检测到已增强 {len(already_enhanced)}/{total_frames} 帧，将继续处理剩余 {len(pending_frames)} 帧",
+                        )
                         
                         # 将待处理帧复制到临时批次目录，避免重复处理已增强的帧
                         batch_dir = os.path.join(PROJECT_ROOT, 'temp', 'batch_enhance')
