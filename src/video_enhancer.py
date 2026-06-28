@@ -3,6 +3,9 @@ import os
 import subprocess
 import shutil
 import re
+import hashlib
+import json
+import time
 from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -22,6 +25,49 @@ cancelled_process_ids = set()
 # 项目根目录路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# 任务状态持久化文件 - 用于断点续传
+TASK_STATE_FILE = os.path.join(PROJECT_ROOT, 'temp', 'task_state.json')
+
+
+def get_url_hash(url):
+    """用 URL 生成唯一标识，用于状态文件索引"""
+    return hashlib.md5(url.encode('utf-8')).hexdigest()
+
+
+def load_task_state():
+    """加载持久化任务状态"""
+    if os.path.exists(TASK_STATE_FILE):
+        try:
+            with open(TASK_STATE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_task_state(state):
+    """保存持久化任务状态"""
+    os.makedirs(os.path.dirname(TASK_STATE_FILE), exist_ok=True)
+    with open(TASK_STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def get_task_state_entry(url):
+    """获取指定 URL 的任务状态"""
+    state = load_task_state()
+    url_hash = get_url_hash(url)
+    return state.get(url_hash, {})
+
+
+def update_url_state(url, **kwargs):
+    """更新指定 URL 的状态字段，如 downloaded=True, converted=True 等"""
+    state = load_task_state()
+    url_hash = get_url_hash(url)
+    if url_hash not in state:
+        state[url_hash] = {"url": url}
+    state[url_hash].update(kwargs)
+    save_task_state(state)
+    
 
 def is_supported_video_url(url):
     """判断是否为当前工具支持的 B 站视频地址。"""
@@ -197,7 +243,7 @@ def download_video_with_progress(url, output_dir, cookies_file, signals):
 
 def process_video_task(url, output_dir, cookies_file, output_format, need_enhance, signals):
     global cancel_flag
-    
+
     def collect_source_videos():
         video_extensions = ('.mp4', '.flv', '.mkv', '.webm')
         source_videos = []
@@ -214,41 +260,57 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
             source_videos.append(filename)
         return source_videos
     
-    before_download_files = set(collect_source_videos())
-    
-    # 步骤0：下载视频
+    # ===== 步骤0：下载视频（支持断点续传）=====
     signals.step_changed.emit(0, 'running')
     
-    if not download_video_with_progress(url, output_dir, cookies_file, signals):
-        return
-    
-    # 标记下载完成
-    signals.step_changed.emit(0, 'completed')
+    # 检查该 URL 是否已下载且文件仍存在
+    state_entry = get_task_state_entry(url)
+    if state_entry.get("downloaded") and state_entry.get("input_path"):
+        cached_path = state_entry["input_path"]
+        if os.path.exists(cached_path):
+            input_path = cached_path
+            input_filename = os.path.basename(input_path)
+            signals.progress.emit(0, f"检测到已下载的视频 ({input_filename})，跳过下载步骤")
+            signals.step_changed.emit(0, 'completed')
+        else:
+            signals.progress.emit(0, f"已下载的视频文件不存在 ({cached_path})，重新下载")
+            before_download_files = set(collect_source_videos())
+            if not download_video_with_progress(url, output_dir, cookies_file, signals):
+                return
+            signals.step_changed.emit(0, 'completed')
+            after_download_files = collect_source_videos()
+            downloaded_files = [f for f in after_download_files if f not in before_download_files]
+            if not downloaded_files:
+                downloaded_files = after_download_files
+            downloaded_files = sorted(downloaded_files, key=lambda f: os.path.getmtime(os.path.join(output_dir, f)))
+            if not downloaded_files:
+                signals.error.emit("未找到下载的视频文件")
+                return
+            input_filename = downloaded_files[-1]
+            input_path = os.path.join(output_dir, input_filename)
+            update_url_state(url, downloaded=True, input_path=input_path, input_filename=input_filename)
+    else:
+        before_download_files = set(collect_source_videos())
+        if not download_video_with_progress(url, output_dir, cookies_file, signals):
+            return
+        signals.step_changed.emit(0, 'completed')
+        after_download_files = collect_source_videos()
+        downloaded_files = [f for f in after_download_files if f not in before_download_files]
+        if not downloaded_files:
+            downloaded_files = after_download_files
+        downloaded_files = sorted(downloaded_files, key=lambda f: os.path.getmtime(os.path.join(output_dir, f)))
+        signals.progress.emit(0, f"找到的视频文件: {downloaded_files}")
+        if not downloaded_files:
+            signals.error.emit("未找到下载的视频文件")
+            return
+        input_filename = downloaded_files[-1]
+        input_path = os.path.join(output_dir, input_filename)
+        update_url_state(url, downloaded=True, input_path=input_path, input_filename=input_filename)
     
     # 检查是否已取消
     if cancel_flag:
         signals.progress.emit(0, "任务已取消")
         return
-    
-    # 查找本次下载的视频文件，避免批量任务误处理目录中的旧文件。
-    after_download_files = collect_source_videos()
-    downloaded_files = [f for f in after_download_files if f not in before_download_files]
-    if not downloaded_files:
-        downloaded_files = after_download_files
-    
-    downloaded_files = sorted(
-        downloaded_files,
-        key=lambda f: os.path.getmtime(os.path.join(output_dir, f))
-    )
-    signals.progress.emit(0, f"找到的视频文件: {downloaded_files}")
-    
-    if not downloaded_files:
-        signals.error.emit("未找到下载的视频文件")
-        return
-    
-    # 获取完整路径
-    input_filename = downloaded_files[-1]
-    input_path = os.path.join(output_dir, input_filename)
     
     # 生成输出文件名（基于原始文件名，添加标识）
     base_name = os.path.splitext(input_filename)[0]
@@ -270,56 +332,63 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
         skip_enhance = True
     else:
         signals.set_enhance_checked.emit(True)  # 勾选增强复选框
-    
+
     # 步骤1：格式转换
     signals.step_changed.emit(1, 'running')
-    signals.progress.emit(0, f"开始格式转换: {input_path}")
-    
-    # 格式转换（带进度显示）
     output_path = os.path.join(output_dir, f"{base_name}{output_suffix}.{output_format}")
-    cmd = ['ffmpeg', '-y', '-i', input_path, '-c:v', 'libx264', '-c:a', 'copy', output_path]
     
-    global current_running_process
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, bufsize=1, universal_newlines=True)
-    current_running_process = process
-    
-    duration_sec = None
-    for line in iter(process.stdout.readline, ''):
-        if line:
-            # 解析进度
-            if 'time=' in line and duration_sec is not None:
-                try:
-                    time_str = line.split('time=')[1].split()[0]
-                    parts = time_str.split(':')
-                    if len(parts) == 3:
-                        current_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-                        progress = min(int(current_sec / duration_sec * 100), 100)
-                        signals.progress.emit(progress, f"格式转换: {progress}%")
-                except:
-                    pass
-            # 获取视频时长
-            elif 'Duration:' in line:
-                try:
-                    dur_str = line.split('Duration:')[1].split(',')[0].strip()
-                    parts = dur_str.split(':')
-                    if len(parts) == 3:
-                        duration_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-                except:
-                    pass
-    
-    process.wait()
-    
-    if process.returncode == 0:
-        signals.progress.emit(100, f"已转换为{output_format}格式")
-        signals.step_changed.emit(1, 'completed')  # 步骤1完成
-        
-        # 检查是否已取消
-        if cancel_flag:
-            signals.progress.emit(0, "任务已取消")
-            return
+    # 检查是否已转换
+    if os.path.exists(output_path):
+        signals.progress.emit(0, f"检测到已转换的视频 ({os.path.basename(output_path)})，跳过格式转换步骤")
+        signals.step_changed.emit(1, 'completed')
     else:
-        signals.error.emit(f"格式转换失败")
+        signals.progress.emit(0, f"开始格式转换: {input_path}")
+        cmd = ['ffmpeg', '-y', '-i', input_path, '-c:v', 'libx264', '-c:a', 'copy', output_path]
+    
+        global current_running_process
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, bufsize=1, universal_newlines=True)
+        current_running_process = process
+    
+        duration_sec = None
+        for line in iter(process.stdout.readline, ''):
+            if line:
+                # 解析进度
+                if 'time=' in line and duration_sec is not None:
+                    try:
+                        time_str = line.split('time=')[1].split()[0]
+                        parts = time_str.split(':')
+                        if len(parts) == 3:
+                            current_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                            progress = min(int(current_sec / duration_sec * 100), 100)
+                            signals.progress.emit(progress, f"格式转换: {progress}%")
+                    except:
+                        pass
+                # 获取视频时长
+                elif 'Duration:' in line:
+                    try:
+                        dur_str = line.split('Duration:')[1].split(',')[0].strip()
+                        parts = dur_str.split(':')
+                        if len(parts) == 3:
+                            duration_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                    except:
+                        pass
+    
+        process.wait()
+    
+        if process.returncode == 0:
+            signals.progress.emit(100, f"已转换为{output_format}格式")
+            signals.step_changed.emit(1, 'completed')  # 步骤1完成
+        else:
+            signals.error.emit(f"格式转换失败")
+            return
+    
+    # 更新状态：标记转换完成
+    update_url_state(url, converted=True, converted_path=output_path)
+    
+    # 检查是否已取消
+    if cancel_flag:
+        signals.progress.emit(0, "任务已取消")
         return
     
     # 如果原视频已经是高清，跳过清晰度增强
@@ -415,17 +484,52 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     
                     # 如果帧不匹配或不存在，清理并重新创建
                     import shutil
+                    
+                    # 缓存帧所属的 URL 与当前 URL 一致时才复用
+                    frames_from_same_url = state_entry.get("frames_url") == url if state_entry else False
+                    
                     if not frames_match:
                         if os.path.exists(frames_dir):
                             shutil.rmtree(frames_dir)
                         os.makedirs(frames_dir, exist_ok=True)
+                    elif frames_from_same_url:
+                        signals.progress.emit(0, f"检测到已提取的帧 ({existing_frames}/{total_video_frames})，跳过提取步骤")
+                    else:
+                        # 帧文件来自不同的视频 URL，清理后重新提取
+                        if os.path.exists(frames_dir):
+                            shutil.rmtree(frames_dir)
+                        os.makedirs(frames_dir, exist_ok=True)
+                        frames_match = False
                     
                     if not enhanced_match:
                         if os.path.exists(enhanced_dir):
                             shutil.rmtree(enhanced_dir)
                         os.makedirs(enhanced_dir, exist_ok=True)
+                    elif frames_from_same_url:
+                        pass  # 同 URL 复用已有增强帧
+                    else:
+                        # 增强帧来自不同的视频 URL，清理后重新处理
+                        if os.path.exists(enhanced_dir):
+                            shutil.rmtree(enhanced_dir)
+                        os.makedirs(enhanced_dir, exist_ok=True)
+                        enhanced_match = False
                     
-                    if frames_match:
+                    # 更新状态：记录当前视频的帧已提取
+                    if frames_match and frames_from_same_url:
+                        pass  # 已经记录过
+                    elif frames_match:
+                        update_url_state(url, frames_url=url)
+                    
+                    # 原代码中额外处理
+                    if not frames_match:
+                        # 注：frames_match=False时，上面已经清理重建了frames_dir
+                        pass
+                    
+                    # frames_match 后续引用，在原值基础上叠加 URL 检查
+                    if not (frames_match and frames_from_same_url):
+                        frames_match = False
+                    
+                    if frames_match and frames_from_same_url:
                         signals.progress.emit(0, f"检测到已提取的帧 ({total_video_frames} 帧)，跳过提取步骤")
                     else:
                         signals.progress.emit(0, "提取视频帧...")
@@ -454,6 +558,9 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     if not frames_match:
                         extract_process.wait()
                     
+                    # 保存帧提取状态，下次运行可直接复用
+                    update_url_state(url, frames_url=url)
+                    
                     # 检查是否已取消
                     if cancel_flag:
                         signals.progress.emit(0, "任务已取消")
@@ -462,78 +569,73 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     # 检查是否已有缓存的增强帧
                     total_frames = len([f for f in os.listdir(frames_dir) if f.endswith('.png')])
                     
-                    if enhanced_match:
+                    # ---- 帧级断点续传：检查已增强的帧，只处理未处理的帧 ----
+                    already_enhanced = set()
+                    if os.path.exists(enhanced_dir):
+                        already_enhanced = set(f for f in os.listdir(enhanced_dir) if f.endswith('.png'))
+                    
+                    all_source_frames = sorted(f for f in os.listdir(frames_dir) if f.endswith('.png'))
+                    pending_frames = [f for f in all_source_frames if f not in already_enhanced]
+                    
+                    if not pending_frames:
                         signals.progress.emit(0, f"检测到已增强的帧 ({total_frames} 帧)，跳过 AI 超分辨率步骤")
                     else:
-                        # 使用 Real-ESRGAN 处理所有帧（目录路径必须以 / 结尾）
-                        signals.progress.emit(0, "AI 超分辨率处理中...")
+                        signals.progress.emit(0, f"AI 超分辨率处理中（剩余 {len(pending_frames)}/{total_frames} 帧待处理）...")
                         
-                        # 使用 Popen 启动 Real-ESRGAN（不等待输出）
-                        # 优化参数：
-                        # -n 指定模型名称，-m 指定模型目录
-                        # -s 4: 放大倍数（4x）
-                        # -j load:proc:save: 线程设置（加载:处理:保存），增加线程数提高速度
-                        # -g gpu-id: 使用 GPU 加速（0=auto，自动选择最快的 GPU）
-                        enhance_cmd = [realesrgan_path, '-i', frames_dir, '-o', f'{enhanced_dir}/', 
+                        # 将待处理帧复制到临时批次目录，避免重复处理已增强的帧
+                        batch_dir = os.path.join(PROJECT_ROOT, 'temp', 'batch_enhance')
+                        shutil.rmtree(batch_dir, ignore_errors=True)
+                        os.makedirs(batch_dir, exist_ok=True)
+                        for f in pending_frames:
+                            shutil.copy2(os.path.join(frames_dir, f), os.path.join(batch_dir, f))
+                        
+                        enhance_cmd = [realesrgan_path, '-i', batch_dir, '-o', f'{enhanced_dir}/',
                                       '-n', model_name, '-m', model_dir, '-s', '4', '-j', '4:8:4', '-g', '0']
-                        process = subprocess.Popen(enhance_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                        process = subprocess.Popen(enhance_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                  text=True, bufsize=1, universal_newlines=True)
                         current_running_process = process
                         
-                        # 实时监控输出目录的帧文件数量来计算进度
-                        import time
-                        processed_count = 0
-                        last_progress_update = 0
-                        while process.poll() is None:  # 进程还在运行
-                            # 检查是否已取消
+                        # 实时监控进度（基于已有增强帧数 + 新生成帧数）
+                        base_enhanced_count = len(already_enhanced)
+                        while process.poll() is None:
                             if cancel_flag:
                                 process.terminate()
                                 process.wait()
+                                shutil.rmtree(batch_dir, ignore_errors=True)
                                 signals.progress.emit(0, "任务已取消")
                                 return
-                            
-                            # 检查输出目录的帧文件数量
                             try:
-                                current_output_frames = len([f for f in os.listdir(enhanced_dir) if f.endswith('.png')])
-                                if current_output_frames > processed_count:
-                                    processed_count = current_output_frames
-                                    # 计算进度百分比，保留2位小数
-                                    percent = round((processed_count / total_frames) * 100, 2) if total_frames > 0 else 0
-                                    # 总是发送进度消息，即使百分比很低（刚开始处理）
-                                    signals.progress.emit(int(percent), f"AI 超分辨率: {percent:.2f}% ({processed_count}/{total_frames} 帧)")
-                                    last_progress_update = percent
+                                current_enhanced = len([f for f in os.listdir(enhanced_dir) if f.endswith('.png')])
+                                new_count = current_enhanced - base_enhanced_count
+                                if new_count > 0:
+                                    total_processed = base_enhanced_count + new_count
+                                    percent = round((total_processed / total_frames) * 100, 2)
+                                    signals.progress.emit(int(percent), f"AI 超分辨率: {percent:.2f}% ({total_processed}/{total_frames} 帧)")
                             except:
                                 pass
-                            
-                            # 等待一小段时间再检查
                             time.sleep(0.5)
+                        
+                        shutil.rmtree(batch_dir, ignore_errors=True)
+                        
+                        if cancel_flag:
+                            signals.progress.emit(0, "任务已取消")
+                            return
+                        
+                        if process.returncode != 0:
+                            signals.progress.emit(0, "Real-ESRGAN 执行失败，使用 FFmpeg 增强")
+                            raise Exception("Real-ESRGAN 执行失败")
+                        
+                        current_enhanced = len([f for f in os.listdir(enhanced_dir) if f.endswith('.png')])
+                        if current_enhanced <= len(already_enhanced):
+                            signals.progress.emit(0, "Real-ESRGAN 未生成新输出，使用 FFmpeg 增强")
+                            raise Exception("Real-ESRGAN 未生成输出")
+                        
+                        signals.progress.emit(0, f"AI 增强完成，共处理 {current_enhanced} 帧")
                     
-                    # 进程结束后再检查一次进度
-                    try:
-                        current_output_frames = len([f for f in os.listdir(enhanced_dir) if f.endswith('.png')])
-                        if current_output_frames > processed_count:
-                            percent = round((current_output_frames / total_frames) * 100, 2) if total_frames > 0 else 0
-                            signals.progress.emit(int(percent), f"AI 超分辨率: {percent:.2f}% ({current_output_frames}/{total_frames} 帧)")
-                    except:
-                        pass
-                    
-                    # 检查是否已取消
-                    if cancel_flag:
-                        signals.progress.emit(0, "任务已取消")
-                        return
-                    
-                    # 检查 Real-ESRGAN 是否成功执行
-                    if process.returncode != 0:
-                        signals.progress.emit(0, "Real-ESRGAN 执行失败，使用 FFmpeg 增强")
-                        raise Exception("Real-ESRGAN 执行失败")
-                    
-                    # 检查是否生成了增强帧
                     enhanced_frame_count = len([f for f in os.listdir(enhanced_dir) if f.endswith('.png')])
                     if enhanced_frame_count == 0:
-                        signals.progress.emit(0, "Real-ESRGAN 未生成输出，使用 FFmpeg 增强")
-                        raise Exception("Real-ESRGAN 未生成输出")
-                    
-                    signals.progress.emit(0, f"AI 增强完成，共处理 {enhanced_frame_count} 帧")
+                        signals.progress.emit(0, "没有可用的增强帧，使用 FFmpeg 增强")
+                        raise Exception("没有可用的增强帧")
                     
                     # 获取原始视频信息
                     cap = cv2.VideoCapture(output_path)
@@ -673,8 +775,6 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     
                     # 清理临时文件
                     os.remove(temp_enhanced) if os.path.exists(temp_enhanced) else None
-                    shutil.rmtree(frames_dir, ignore_errors=True)
-                    shutil.rmtree(enhanced_dir, ignore_errors=True)
                     
                     signals.step_changed.emit(3, 'completed')  # 步骤3完成
                     signals.step_changed.emit(2, 'completed')  # 步骤2完成
