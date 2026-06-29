@@ -6,6 +6,7 @@ import re
 import hashlib
 import json
 import time
+import signal
 from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -21,6 +22,108 @@ from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QPolygon
 current_running_process = None
 cancel_flag = False
 cancelled_process_ids = set()
+
+
+def start_tracked_process(cmd, **kwargs):
+    """启动可统一取消的子进程，并让其拥有独立进程组。"""
+    global current_running_process
+    process = subprocess.Popen(cmd, start_new_session=True, **kwargs)
+    current_running_process = process
+    return process
+
+
+def terminate_process_tree(process, timeout=3):
+    """优先终止整个进程组，避免 Real-ESRGAN/FFmpeg 子进程继续运行。"""
+    if not process or process.poll() is not None:
+        return
+    
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+    
+    try:
+        process.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    
+    try:
+        process.wait(timeout=1)
+    except Exception:
+        pass
+
+
+def cleanup_orphaned_project_processes():
+    """清理当前项目遗留的孤儿处理进程，避免继续写入 temp 缓存。"""
+    try:
+        output = subprocess.check_output(
+            ['ps', '-axo', 'pid=,ppid=,command='],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    
+    cleaned = []
+    project_path = normalize_cache_path(PROJECT_ROOT)
+    process_keywords = ('ffmpeg', 'realesrgan-ncnn-vulkan')
+    
+    for line in output.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        
+        command = parts[2]
+        if pid == os.getpid() or ppid != 1:
+            continue
+        if not any(keyword in command for keyword in process_keywords):
+            continue
+        if project_path not in normalize_cache_path(command):
+            continue
+        
+        try:
+            os.kill(pid, signal.SIGTERM)
+            cleaned.append(pid)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            pass
+    
+    time.sleep(0.2)
+    for pid in cleaned:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+        
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+    
+    return cleaned
 
 # 项目根目录路径
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -68,6 +171,47 @@ def update_url_state(url, **kwargs):
     state[url_hash].update(kwargs)
     save_task_state(state)
     
+
+def normalize_cache_path(path):
+    """归一化缓存路径，避免相对路径或软链接导致同一文件匹配失败。"""
+    if not path:
+        return ""
+    return os.path.normcase(os.path.realpath(path)).lower()
+
+
+def cache_paths_match(left_path, right_path):
+    """判断两个缓存路径是否指向同一文件，兼容 macOS 默认大小写不敏感文件系统。"""
+    if not left_path or not right_path:
+        return False
+    
+    try:
+        if os.path.exists(left_path) and os.path.exists(right_path) and os.path.samefile(left_path, right_path):
+            return True
+    except OSError:
+        pass
+    
+    return normalize_cache_path(left_path) == normalize_cache_path(right_path)
+
+
+def find_same_video_cache_entry(output_path):
+    """跨全部 task_state 记录查找同一转换视频的缓存记录。"""
+    if not output_path:
+        return {}
+    
+    for entry in load_task_state().values():
+        has_frame_cache_marker = bool(entry.get("frames_url") or entry.get("frames_source_path"))
+        if not has_frame_cache_marker:
+            continue
+        
+        cached_paths = (
+            entry.get("frames_source_path"),
+            entry.get("converted_path"),
+        )
+        if any(cache_paths_match(cached_path, output_path) for cached_path in cached_paths):
+            return entry
+    
+    return {}
+
 
 def get_existing_frame_numbers(frames_dir):
     """读取已提取帧编号，用于判断是否可以断点续提取。"""
@@ -202,7 +346,7 @@ def download_video_with_progress(url, output_dir, cookies_file, signals):
         cmd.append(url)
         
         global current_running_process
-        process = subprocess.Popen(
+        process = start_tracked_process(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -216,6 +360,11 @@ def download_video_with_progress(url, output_dir, cookies_file, signals):
         
         last_percentage = 0
         for line in iter(process.stdout.readline, ''):
+            if cancel_flag:
+                terminate_process_tree(process)
+                signals.progress.emit(0, "当前任务已取消")
+                return False
+            
             line = line.strip()
             if line:
                 # 解析下载进度百分比
@@ -368,12 +517,17 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
         cmd = ['ffmpeg', '-y', '-i', input_path, '-c:v', 'libx264', '-c:a', 'copy', output_path]
     
         global current_running_process
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        process = start_tracked_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, bufsize=1, universal_newlines=True)
         current_running_process = process
     
         duration_sec = None
         for line in iter(process.stdout.readline, ''):
+            if cancel_flag:
+                terminate_process_tree(process)
+                signals.progress.emit(0, "任务已取消")
+                return
+            
             if line:
                 # 解析进度
                 if 'time=' in line and duration_sec is not None:
@@ -496,19 +650,30 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     if frames_exist:
                         frames_match = (
                             total_video_frames > 0
-                            and existing_frames == total_video_frames
-                            and get_contiguous_frame_count(existing_frame_numbers) == total_video_frames
+                            and existing_frames >= total_video_frames
+                            and get_contiguous_frame_count(existing_frame_numbers) >= total_video_frames
                         )
                     else:
                         frames_match = False
                     
-                    # B站 URL 参数可能变化；同一转换后文件也视为同一视频缓存。
+                    # B站 URL 参数可能变化；跨全部状态记录查找同一转换后视频缓存。
+                    same_video_cache_entry = find_same_video_cache_entry(output_path)
                     frames_from_same_url = state_entry.get("frames_url") == url if state_entry else False
+                    state_has_frame_cache_marker = bool(
+                        state_entry.get("frames_url") or state_entry.get("frames_source_path")
+                    ) if state_entry else False
+                    frames_from_same_state_path = (
+                        state_has_frame_cache_marker
+                        and (
+                            cache_paths_match(state_entry.get("frames_source_path"), output_path)
+                            or cache_paths_match(state_entry.get("converted_path"), output_path)
+                        )
+                    ) if state_entry else False
                     frames_from_same_video = (
                         frames_from_same_url
-                        or state_entry.get("frames_source_path") == output_path
-                        or state_entry.get("converted_path") == output_path
-                    ) if state_entry else False
+                        or bool(same_video_cache_entry)
+                        or frames_from_same_state_path
+                    )
                     
                     resume_extract_start_frame = None
                     if not frames_match:
@@ -580,12 +745,17 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                             ]
                         else:
                             extract_cmd = ['ffmpeg', '-y', '-i', output_path, '-q:v', '1', f'{frames_dir}/frame_%08d.png']
-                        extract_process = subprocess.Popen(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                        extract_process = start_tracked_process(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                                           text=True, bufsize=1, universal_newlines=True)
                         current_running_process = extract_process
                         
                         last_extract_progress = 0
                         for line in iter(extract_process.stdout.readline, ''):
+                            if cancel_flag:
+                                terminate_process_tree(extract_process)
+                                signals.progress.emit(0, "任务已取消")
+                                return
+                            
                             if line:
                                 # 解析 FFmpeg 输出中的帧数
                                 if 'frame=' in line:
@@ -643,7 +813,7 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                         
                         enhance_cmd = [realesrgan_path, '-i', batch_dir, '-o', f'{enhanced_dir}/',
                                       '-n', model_name, '-m', model_dir, '-s', '4', '-j', '1:2:1', '-g', '0']
-                        process = subprocess.Popen(enhance_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        process = start_tracked_process(enhance_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                  text=True, bufsize=1, universal_newlines=True)
                         current_running_process = process
                         
@@ -651,7 +821,7 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                         base_enhanced_count = len(already_enhanced)
                         while process.poll() is None:
                             if cancel_flag:
-                                process.terminate()
+                                terminate_process_tree(process)
                                 process.wait()
                                 shutil.rmtree(batch_dir, ignore_errors=True)
                                 signals.progress.emit(0, "任务已取消")
@@ -720,13 +890,13 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                                   '-i', output_path, '-c:v', 'libx264', '-crf', '16', '-preset', 'slow', 
                                   '-pix_fmt', 'yuv420p', '-c:a', 'copy', temp_enhanced]
                     
-                    process = subprocess.Popen(convert_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    process = start_tracked_process(convert_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              text=True, bufsize=1, universal_newlines=True)
                     current_running_process = process
                     for line in iter(process.stdout.readline, ''):
                         # 检查是否已取消
                         if cancel_flag:
-                            process.terminate()
+                            terminate_process_tree(process)
                             signals.progress.emit(0, "任务已取消")
                             return
                         if line and 'frame=' in line:
@@ -754,13 +924,13 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                                '-filter:v', f'setpts={pts_ratio}*PTS,fps={original_fps}', 
                                '-c:a', 'copy', '-shortest', enhanced_path]
                     
-                    process = subprocess.Popen(sync_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    process = start_tracked_process(sync_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              text=True, bufsize=1, universal_newlines=True)
                     current_running_process = process
                     for line in iter(process.stdout.readline, ''):
                         # 检查是否已取消
                         if cancel_flag:
-                            process.terminate()
+                            terminate_process_tree(process)
                             signals.progress.emit(0, "任务已取消")
                             return
                         if line and 'time=' in line:
@@ -799,13 +969,13 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                                  '-c:v', 'libx264', '-crf', '15', '-preset', 'medium',
                                  '-c:a', 'copy', detail_enhanced]
                     
-                    process = subprocess.Popen(detail_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    process = start_tracked_process(detail_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              text=True, bufsize=1, universal_newlines=True)
                     current_running_process = process
                     for line in iter(process.stdout.readline, ''):
                         # 检查是否已取消
                         if cancel_flag:
-                            process.terminate()
+                            terminate_process_tree(process)
                             signals.progress.emit(0, "任务已取消")
                             return
                         if line and 'time=' in line:
@@ -837,6 +1007,10 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                     signals.progress.emit(0, f"AI 增强完成！文件: {enhanced_path}")
                     
                 except Exception as e:
+                    if cancel_flag:
+                        signals.progress.emit(0, "任务已取消")
+                        return
+                    
                     # 提供详细的错误信息
                     error_details = []
                     if not os.path.exists(realesrgan_path):
@@ -872,10 +1046,15 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                           '-c:v', 'libx264', '-crf', '16', '-preset', 'slow',
                           '-c:a', 'copy', enhanced_path]
                     
-                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    process = start_tracked_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              text=True, bufsize=1, universal_newlines=True)
                     current_running_process = process
                     for line in iter(process.stdout.readline, ''):
+                        if cancel_flag:
+                            terminate_process_tree(process)
+                            signals.progress.emit(0, "任务已取消")
+                            return
+                        
                         # FFmpeg 进度输出格式: time=00:00:09.86 或 time:00:00:09.86
                         if 'time=' in line or 'time:' in line:
                             try:
@@ -906,13 +1085,13 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                                '-filter:v', f'setpts={original_duration / (original_duration - 0.1)}*PTS,fps={original_fps}',
                                '-c:a', 'copy', '-shortest', temp_sync]
                     
-                    process = subprocess.Popen(sync_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    process = start_tracked_process(sync_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              text=True, bufsize=1, universal_newlines=True)
                     current_running_process = process
                     for line in iter(process.stdout.readline, ''):
                         # 检查是否已取消
                         if cancel_flag:
-                            process.terminate()
+                            terminate_process_tree(process)
                             signals.progress.emit(0, "任务已取消")
                             return
                         if 'time=' in line or 'time:' in line:
@@ -964,13 +1143,13 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                       '-c:v', 'libx264', '-crf', '16', '-preset', 'medium',
                       '-c:a', 'copy', enhanced_path]
                 
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                process = start_tracked_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          text=True, bufsize=1, universal_newlines=True)
                 current_running_process = process
                 for line in iter(process.stdout.readline, ''):
                     # 检查是否已取消
                     if cancel_flag:
-                        process.terminate()
+                        terminate_process_tree(process)
                         signals.progress.emit(0, "任务已取消")
                         return
                     if line:
@@ -1003,13 +1182,13 @@ def process_video_task(url, output_dir, cookies_file, output_format, need_enhanc
                            '-filter:v', f'setpts={original_duration / (original_duration - 0.1)}*PTS,fps={original_fps}',
                            '-c:a', 'copy', '-shortest', temp_sync]
                 
-                process = subprocess.Popen(sync_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                process = start_tracked_process(sync_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          text=True, bufsize=1, universal_newlines=True)
                 current_running_process = process
                 for line in iter(process.stdout.readline, ''):
                     # 检查是否已取消
                     if cancel_flag:
-                        process.terminate()
+                        terminate_process_tree(process)
                         signals.progress.emit(0, "任务已取消")
                         return
                     if 'time=' in line or 'time:' in line:
@@ -1670,14 +1849,24 @@ class VideoDownloader(FrostedGlassWindow):
             should_ignore_cancel_error = "you_get" not in command_text
             if current_running_process.pid:
                 cancelled_process_ids.add(current_running_process.pid)
-            current_running_process.terminate()
+            terminate_process_tree(current_running_process)
             current_running_process = None
         
         if was_batch_running:
             self.failed_count += 1
             if should_ignore_cancel_error:
                 self.ignore_cancel_error_count += 1
+            if self.process_thread and self.process_thread.is_alive():
+                self.process_thread.join(timeout=5)
             has_next_task = cancelled_task_number < len(self.task_urls)
+            if self.process_thread and self.process_thread.is_alive():
+                self.batch_running = False
+                self.status_text.append(f"任务 {cancelled_task_number}/{len(self.task_urls)} 正在停止，请稍后再继续")
+                self.set_task_controls_enabled(True)
+                self.cancel_btn.hide()
+                self.cancel_all_btn.hide()
+                self.update_task_status_label("cancelled")
+                return
             next_action = "继续下一个任务" if has_next_task else "已没有后续任务"
             self.status_text.append(f"任务 {cancelled_task_number}/{len(self.task_urls)} 已取消，{next_action}")
             self.current_task_index += 1
@@ -1730,7 +1919,7 @@ class VideoDownloader(FrostedGlassWindow):
             should_ignore_cancel_error = "you_get" not in command_text
             if current_running_process.pid:
                 cancelled_process_ids.add(current_running_process.pid)
-            current_running_process.terminate()
+            terminate_process_tree(current_running_process)
             current_running_process = None
         
         if was_batch_running and self.current_task_index < len(self.task_urls):
@@ -1949,6 +2138,10 @@ class VideoDownloader(FrostedGlassWindow):
         if not output_dir:
             output_dir = os.getcwd()
         os.makedirs(output_dir, exist_ok=True)
+        
+        cleaned_pids = cleanup_orphaned_project_processes()
+        if cleaned_pids:
+            self.status_text.append(f"已清理残留处理进程: {', '.join(map(str, cleaned_pids))}")
         
         self.task_urls = task_urls
         self.current_task_index = 0
