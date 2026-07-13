@@ -1,0 +1,54 @@
+{
+  "name": "video-enhancer",
+  "version": "2.0.0",
+  "description": "Electron desktop UI for Bilibili video download, conversion and enhancement.",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "build:worker": "node scripts/build-python-worker.js",
+    "dist:mac": "npm run build:worker && npx --yes electron-builder --mac",
+    "dist:win": "npm run build:worker && npx --yes electron-builder --win"
+  },
+  "build": {
+    "appId": "com.local.videoenhancer",
+    "productName": "Video Enhancer",
+    "asar": false,
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "resources/icons/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "dist-python/video_enhancer_worker",
+        "to": "python-worker"
+      }
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "zip",
+        "dir"
+      ],
+      "category": "public.app-category.video"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^31.7.7"
+  }
+}

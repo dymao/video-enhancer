@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video Enhancer</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="app-window">
+    <header class="window-title">
+      <div class="brand-block">
+        <div class="app-logo gradient-logo" aria-hidden="true">
+          <span>VE</span>
+        </div>
+        <div>
+          <span class="eyebrow">VIDEO ENHANCER</span>
+          <h1>B站视频下载与增强工具</h1>
+          <p>下载、转码、清晰增强和音画同步的一站式视频处理台</p>
+        </div>
+      </div>
+      <div class="title-actions">
+        <span class="live-badge">高清视频处理</span>
+        <label class="theme-switcher" for="themeSelect">
+          <span>主题</span>
+          <select id="themeSelect" aria-label="主题选择">
+            <option value="system">跟随系统</option>
+            <option value="light">浅色</option>
+            <option value="dark">深色</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <div class="main-layout">
+      <div class="operation-panel">
+        <section class="form-section">
+          <label class="field-label" for="urlInput">B站视频链接URL:</label>
+          <div class="row">
+            <input id="urlInput" type="url" aria-describedby="urlInputMessage" placeholder="请输入 B 站视频地址，例如 https://www.bilibili.com/video/BV...">
+            <button id="addTaskButton" class="blue-button" type="button">添加任务</button>
+          </div>
+          <div class="row quality-row">
+            <label class="field-label fixed-label" for="qualitySelect">清晰度:</label>
+            <select id="qualitySelect">
+              <option value="">自动选择最高清</option>
+            </select>
+            <span id="qualityStatus" class="quality-status">贴入地址后自动查询可选清晰度</span>
+            <span class="cookies-tip">提示：下载 720p 及以上分辨率视频需要登录 B 站账号的 cookies 文件。导入/选择 cookies 后将自动重新查询清晰度选项。</span>
+          </div>
+          <p id="urlInputMessage" class="input-alert" hidden></p>
+        </section>
+
+        <section class="form-section" id="cookiesSection">
+          <label class="field-label" for="cookiesInput">Cookies文件路径（下载720p+高清视频需要）:</label>
+          <div class="row">
+            <input id="cookiesInput" type="text" placeholder="可选，选择或粘贴 cookies 文件路径">
+            <button id="importCookiesButton" class="gray-button" type="button">自动导入</button>
+            <button id="browseCookiesButton" class="gray-button" type="button">选择...</button>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <div class="section-title">
+            <label class="field-label" for="taskList">任务列表（按添加顺序逐个下载和转换）:</label>
+            <span id="taskCount" class="task-count">0 个任务</span>
+          </div>
+          <ul id="taskList" class="task-list" aria-label="任务列表"></ul>
+          <div class="button-row right">
+            <button id="removeTaskButton" class="gray-button" type="button">删除选中</button>
+            <button id="clearTasksButton" class="gray-button" type="button">清空列表</button>
+          </div>
+        </section>
+
+        <section class="form-section">
+          <div class="row labeled-row output-row">
+            <label class="field-label fixed-label" for="outputDirInput">输出目录:</label>
+            <input id="outputDirInput" class="output-path-input" type="text" readonly>
+            <button id="browseOutputButton" class="gray-button" type="button">浏览...</button>
+            <label class="field-label format-label" for="formatSelect">输出格式:</label>
+            <select id="formatSelect">
+              <option value="MP4">MP4</option>
+              <option value="MKV">MKV</option>
+            </select>
+          </div>
+        </section>
+
+        <label class="checkbox-line">
+          <input id="enhanceCheck" type="checkbox" checked>
+          <span>增强视频清晰度（优先使用 Real-ESRGAN，失败后自动使用 FFmpeg 增强）</span>
+        </label>
+
+        <section class="button-row run-row">
+          <button id="startButton" class="green-button" type="button">下载并转换</button>
+          <button id="cancelButton" class="red-button" type="button" disabled>取消当前</button>
+        </section>
+      </div>
+
+      <div class="monitor-panel">
+        <section class="status-section">
+          <div id="statusTitle" class="status-title">任务状态：未开始</div>
+
+          <label class="field-label">当前任务流程:</label>
+          <div class="steps" id="steps">
+            <div class="step" data-step="0">
+              <span>1</span>
+              <em class="step-icon download-icon" aria-hidden="true"></em>
+              <strong>下载视频</strong>
+            </div>
+            <i></i>
+            <div class="step" data-step="1">
+              <span>2</span>
+              <em class="step-icon convert-icon" aria-hidden="true"></em>
+              <strong>格式转换</strong>
+            </div>
+            <i></i>
+            <div class="step" data-step="2">
+              <span>3</span>
+              <em class="step-icon enhance-icon" aria-hidden="true"></em>
+              <strong>AI清晰增强</strong>
+            </div>
+            <i></i>
+            <div class="step" data-step="3">
+              <span>4</span>
+              <em class="step-icon sync-icon" aria-hidden="true"></em>
+              <strong>音画同步</strong>
+            </div>
+          </div>
+
+          <div class="progress-row">
+            <div class="progress-track">
+              <div id="progressBar" class="progress-bar"></div>
+            </div>
+            <strong id="progressText">0.00%</strong>
+          </div>
+          <div id="currentMessage" class="status-message">等待任务开始</div>
+          <div id="timeEstimate" class="time-label">当前步骤 已耗时: --:-- | 预估剩余: --:--</div>
+        </section>
+
+        <section class="log-section">
+          <div class="section-title">
+            <label class="field-label" for="logOutput">处理日志:</label>
+            <button id="clearLogButton" class="gray-button small-button" type="button">清空日志</button>
+          </div>
+          <pre id="logOutput" class="log-output"></pre>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script src="./renderer.js"></script>
+</body>
+</html>

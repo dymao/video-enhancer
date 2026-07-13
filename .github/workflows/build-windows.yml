@@ -1,0 +1,50 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    name: Build Windows installer and portable EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        shell: powershell
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build Windows packages
+        run: npm run dist:win
+
+      - name: List release files
+        shell: powershell
+        run: Get-ChildItem -Path release -Recurse | Select-Object FullName, Length
+
+      - name: Upload Windows EXE artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-enhancer-windows-exe
+          path: |
+            release/*.exe
+            release/*.blockmap
+          if-no-files-found: error

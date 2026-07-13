@@ -5,6 +5,8 @@ __pycache__/
 *.so
 .Python
 build/
+dist-python/
+release/
 develop-eggs/
 dist/
 downloads/
@@ -25,6 +27,8 @@ venv/
 env/
 ENV/
 .venv
+.venv-build-worker/
+node_modules/
 
 # IDE
 .vscode/
